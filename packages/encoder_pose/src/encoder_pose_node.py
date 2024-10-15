@@ -65,7 +65,7 @@ class EncoderPoseNode(DTROS):
 
         # Odometry publisher
         self.db_estimated_pose = rospy.Publisher(
-            f"/{self.veh}/pose", Odometry, queue_size=1, dt_topic_type=TopicType.LOCALIZATION
+            f"/{self.veh}/encoder_localization", Odometry, queue_size=1, dt_topic_type=TopicType.LOCALIZATION
         )
 
 
