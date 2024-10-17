@@ -42,15 +42,6 @@ class EncoderPoseNode(DTROS):
         # get the name of the robot
         self.veh = rospy.get_namespace().strip("/")
 
-        # internal state
-        # - odometry
-        self.x_prev = 0.0
-        self.y_prev = 0.0
-        self.theta_prev = 0.0
-        self.x_curr = 0.0
-        self.y_curr = 0.0
-        self.theta_curr = 0.0
-
         self.right_wheel_mutex = Lock()
         self.left_wheel_mutex = Lock()
 
@@ -95,9 +86,6 @@ class EncoderPoseNode(DTROS):
         self.y_prev = 0.0
         self.theta_prev = 0.0
 
-        self.x_curr = 0.0
-        self.y_curr = 0.0
-        self.theta_curr = 0.0
 
     def cbLeftEncoder(self, encoder_msg):
         """
@@ -117,10 +105,8 @@ class EncoderPoseNode(DTROS):
             )
             if delta_phi_left == 0:
                 return
-            print(f"Left: prev_ticks: {self.left_tick_prev}, curr_ticks: {encoder_msg.data}")
             self.left_tick_prev = left_ticks_prev
             self.delta_phi_left += delta_phi_left
-            print(f"Delta_phi_left: {self.delta_phi_left}")
 
     def cbRightEncoder(self, encoder_msg):
         """
@@ -140,10 +126,8 @@ class EncoderPoseNode(DTROS):
             )
             if delta_phi_right == 0:
                 return
-            print(f"Right: prev_ticks: {self.right_tick_prev}, curr_ticks: {encoder_msg.data}")
             self.right_tick_prev = right_tick_prev
             self.delta_phi_right += delta_phi_right
-            print(f"Delta_phi_right: {self.delta_phi_right}")
 
     def posePublisher(self, event=None):
         """
@@ -155,7 +139,7 @@ class EncoderPoseNode(DTROS):
         with self.left_wheel_mutex:
             with self.right_wheel_mutex:
 
-                self.x_curr, self.y_curr, theta_curr = estimate_pose(
+                x_curr, y_curr, theta_curr = estimate_pose(
                     self.R,
                     self.baseline,
                     self.x_prev,
@@ -165,15 +149,18 @@ class EncoderPoseNode(DTROS):
                     self.delta_phi_right,
                 )
 
-                self.theta_curr = self.angle_clamp(theta_curr)  # angle always between 0,2pi
+                if (x_curr == self.x_prev) and (y_curr == self.y_prev) and (theta_curr == self.theta_prev):
+                    return
+
+                theta_curr = self.angle_clamp(theta_curr)  # angle always between 0,2pi
 
                 # self.loging to screen for debugging purposes
                 self.log("              ODOMETRY             ")
                 # self.log(f"Baseline : {self.baseline}   R: {self.R}")
                 self.log("Just this move:")
-                self.log(f"Theta : {np.rad2deg(self.theta_curr) - np.rad2deg(self.theta_prev)} deg,  x: {self.x_curr - self.x_prev} m,  y: {self.y_curr - self.y_prev} m")
+                self.log(f"Theta : {np.rad2deg(theta_curr) - np.rad2deg(self.theta_prev)} deg,  x: {x_curr - self.x_prev} m,  y: {y_curr - self.y_prev} m")
                 self.log("Total accumulated:")
-                self.log(f"Theta : {np.rad2deg(self.theta_curr)} deg,  x: {self.x_curr} m,  y: {self.y_curr} m")
+                self.log(f"Theta : {np.rad2deg(theta_curr)} deg,  x: {x_curr} m,  y: {y_curr} m")
 
                 self.log(
                     f"Rotation left wheel : {np.rad2deg(self.delta_phi_left)} deg,   "
@@ -188,24 +175,24 @@ class EncoderPoseNode(DTROS):
                 self.delta_phi_right = 0
 
                 # Current estimate becomes previous estimate at next iteration
-                self.x_prev = self.x_curr
-                self.y_prev = self.y_curr
-                self.theta_prev = self.theta_curr
+                self.x_prev = x_curr
+                self.y_prev = y_curr
+                self.theta_prev = theta_curr
 
                 # Creating message to plot pose in RVIZ
                 odom = Odometry()
                 odom.header.frame_id = "map"
                 odom.header.stamp = rospy.Time.now()
 
-                odom.pose.pose.position.x = self.x_curr  # x position - estimate
-                odom.pose.pose.position.y = self.y_curr  # y position - estimate
+                odom.pose.pose.position.x = x_curr  # x position - estimate
+                odom.pose.pose.position.y = y_curr  # y position - estimate
                 odom.pose.pose.position.z = 0  # z position - no flying allowed in Duckietown
 
                 # these are quaternions - stuff for a different course!
                 odom.pose.pose.orientation.x = 0
                 odom.pose.pose.orientation.y = 0
-                odom.pose.pose.orientation.z = np.sin(self.theta_curr / 2)
-                odom.pose.pose.orientation.w = np.cos(self.theta_curr / 2)
+                odom.pose.pose.orientation.z = np.sin(theta_curr / 2)
+                odom.pose.pose.orientation.w = np.cos(theta_curr / 2)
 
                 self.db_estimated_pose.publish(odom)
 
