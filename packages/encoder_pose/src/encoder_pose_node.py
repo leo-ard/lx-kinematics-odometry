@@ -12,6 +12,7 @@ from nav_msgs.msg import Odometry
 
 from encoder_pose.include.odometry.odometry import delta_phi, estimate_pose
 
+from multiprocessing import Lock
 
 class EncoderPoseNode(DTROS):
     """
@@ -50,23 +51,8 @@ class EncoderPoseNode(DTROS):
         self.y_curr = 0.0
         self.theta_curr = 0.0
 
-        # - PID controller
-        #   - previous tracking error, starts at 0
-        self.prev_e = 0.0
-        #   - previous tracking error integral, starts at 0
-        self.prev_int = 0.0
-        self.time_now: float = 0.0
-        self.time_last_step: float = 0.0
-
-        # fixed robot linear velocity - starts at zero so the activities start on command
-        self.v_0 = 0.0
-        # reference y for PID lateral control activity - zero so can set interactively at runtime
-        self.y_ref = 0.0
-
-        # initial reference signal for heading control activity
-        self.theta_ref = np.deg2rad(0.0)
-        # initializing omega command to the robot
-        self.omega = 0.0
+        self.right_wheel_mutex = Lock()
+        self.left_wheel_mutex = Lock()
 
         # Init the parameters
         self.resetParameters()
@@ -80,11 +66,11 @@ class EncoderPoseNode(DTROS):
 
         # Wheel encoder subscriber:
         left_encoder_topic = f"/{self.veh}/left_wheel_encoder_driver_node/tick"
-        rospy.Subscriber(left_encoder_topic, WheelEncoderStamped, self.cbLeftEncoder, queue_size=1)
+        rospy.Subscriber(left_encoder_topic, WheelEncoderStamped, self.cbLeftEncoder)
 
         # Wheel encoder subscriber:
         right_encoder_topic = f"/{self.veh}/right_wheel_encoder_driver_node/tick"
-        rospy.Subscriber(right_encoder_topic, WheelEncoderStamped, self.cbRightEncoder, queue_size=1)
+        rospy.Subscriber(right_encoder_topic, WheelEncoderStamped, self.cbRightEncoder)
 
         # Odometry publisher
         self.db_estimated_pose = rospy.Publisher(
@@ -92,15 +78,9 @@ class EncoderPoseNode(DTROS):
         )
 
 
-        # Wait until the encoders data is received, then start the controller
-        self.duckiebot_is_moving = False
-        self.STOP = False
-
-        # For encoders syncronization:
-        self.RIGHT_RECEIVED = False
-        self.LEFT_RECEIVED = False
 
         self.log("Initialized.")
+        rospy.Timer(rospy.Duration(1.0/2.0), self.posePublisher)
 
     def resetParameters(self):
         # Add the node parameters to the parameters dictionary
@@ -119,43 +99,28 @@ class EncoderPoseNode(DTROS):
         self.y_curr = 0.0
         self.theta_curr = 0.0
 
-        # Initializing the PID controller parameters
-        self.prev_e = 0.0  # previous tracking error, starts at 0
-        self.prev_int = 0.0  # previous tracking error integral, starts at 0
-        self.time_now: float = 0.0
-        self.time_last_step: float = 0.0
-
-        # fixed robot linear velocity - starts at zero so the activities start on command
-        self.v_0 = 0.0
-        # reference y for PID lateral control activity - zero so can set interactively at runtime
-        self.y_ref = 0.0
-
-
     def cbLeftEncoder(self, encoder_msg):
         """
         Wheel encoder callback
         Args:
             encoder_msg (:obj:`WheelEncoderStamped`) encoder ROS message.
         """
+        with self.left_wheel_mutex:
+            # initializing ticks to stored absolute value
+            if self.left_tick_prev is None:
+                self.left_tick_prev = encoder_msg.data
+                return
 
-        # initializing ticks to stored absolute value
-        if self.left_tick_prev is None:
-            ticks = encoder_msg.data
-            self.left_tick_prev = ticks
-            return
-
-        # running the DeltaPhi() function copied from the notebooks to calculate rotations
-        delta_phi_left, self.left_tick_prev = delta_phi(
-            encoder_msg.data, self.left_tick_prev, encoder_msg.resolution
-        )
-        self.delta_phi_left += delta_phi_left
-
-        # update time
-        self.time_now = max(self.time_now, encoder_msg.header.stamp.to_sec())
-
-        # compute the new pose
-        self.LEFT_RECEIVED = True
-        self.posePublisher()
+            # running the DeltaPhi() function copied from the notebooks to calculate rotations
+            delta_phi_left, left_ticks_prev = delta_phi(
+                encoder_msg.data, self.left_tick_prev, encoder_msg.resolution
+            )
+            if delta_phi_left == 0:
+                return
+            print(f"Left: prev_ticks: {self.left_tick_prev}, curr_ticks: {encoder_msg.data}")
+            self.left_tick_prev = left_ticks_prev
+            self.delta_phi_left += delta_phi_left
+            print(f"Delta_phi_left: {self.delta_phi_left}")
 
     def cbRightEncoder(self, encoder_msg):
         """
@@ -164,87 +129,85 @@ class EncoderPoseNode(DTROS):
             encoder_msg (:obj:`WheelEncoderStamped`) encoder ROS message.
         """
 
-        if self.right_tick_prev is None:
-            ticks = encoder_msg.data
-            self.right_tick_prev = ticks
-            return
+        with self.right_wheel_mutex:
+            if self.right_tick_prev is None:
+                self.right_tick_prev = encoder_msg.data
+                return
 
-        # calculate rotation of right wheel
-        delta_phi_right, self.right_tick_prev = delta_phi(
-            encoder_msg.data, self.right_tick_prev, encoder_msg.resolution
-        )
-        self.delta_phi_right += delta_phi_right
+            # calculate rotation of right wheel
+            delta_phi_right, right_tick_prev = delta_phi(
+                encoder_msg.data, self.right_tick_prev, encoder_msg.resolution
+            )
+            if delta_phi_right == 0:
+                return
+            print(f"Right: prev_ticks: {self.right_tick_prev}, curr_ticks: {encoder_msg.data}")
+            self.right_tick_prev = right_tick_prev
+            self.delta_phi_right += delta_phi_right
+            print(f"Delta_phi_right: {self.delta_phi_right}")
 
-        # update time
-        self.time_now = max(self.time_now, encoder_msg.header.stamp.to_sec())
-
-        # compute the new pose
-        self.RIGHT_RECEIVED = True
-        self.posePublisher()
-
-    def posePublisher(self):
+    def posePublisher(self, event=None):
         """
         Publish the pose of the Duckiebot given by the kinematic model
             using the encoders.
         Publish:
             ~/pose (:obj:`PoseStamped`): Duckiebot pose.
         """
-        if self.STOP or not (self.LEFT_RECEIVED and self.RIGHT_RECEIVED):
-            return
+        with self.left_wheel_mutex:
+            with self.right_wheel_mutex:
 
-        # synch incoming messages from encoders
-        self.LEFT_RECEIVED = self.RIGHT_RECEIVED = False
+                self.x_curr, self.y_curr, theta_curr = estimate_pose(
+                    self.R,
+                    self.baseline,
+                    self.x_prev,
+                    self.y_prev,
+                    self.theta_prev,
+                    self.delta_phi_left,
+                    self.delta_phi_right,
+                )
 
-        self.x_curr, self.y_curr, theta_curr = estimate_pose(
-            self.R,
-            self.baseline,
-            self.x_prev,
-            self.y_prev,
-            self.theta_prev,
-            self.delta_phi_left,
-            self.delta_phi_right,
-        )
+                self.theta_curr = self.angle_clamp(theta_curr)  # angle always between 0,2pi
 
-        self.theta_curr = self.angle_clamp(theta_curr)  # angle always between 0,2pi
+                # self.loging to screen for debugging purposes
+                self.log("              ODOMETRY             ")
+                # self.log(f"Baseline : {self.baseline}   R: {self.R}")
+                self.log("Just this move:")
+                self.log(f"Theta : {np.rad2deg(self.theta_curr) - np.rad2deg(self.theta_prev)} deg,  x: {self.x_curr - self.x_prev} m,  y: {self.y_curr - self.y_prev} m")
+                self.log("Total accumulated:")
+                self.log(f"Theta : {np.rad2deg(self.theta_curr)} deg,  x: {self.x_curr} m,  y: {self.y_curr} m")
 
-        # self.loging to screen for debugging purposes
-        self.log("              ODOMETRY             ")
-        # self.log(f"Baseline : {self.baseline}   R: {self.R}")
-        self.log(f"Theta : {np.rad2deg(self.theta_curr)} deg,  x: {self.x_curr} m,  y: {self.y_curr} m")
-        self.log(
-            f"Rotation left wheel : {np.rad2deg(self.delta_phi_left)} deg,   "
-            f"Rotation right wheel : {np.rad2deg(self.delta_phi_right)} deg"
-        )
-        self.log(f"Prev Ticks left : {self.left_tick_prev}   Prev Ticks right : {self.right_tick_prev}")
-        # self.log(
-        #     f"Prev integral error : {self.prev_int}")
+                self.log(
+                    f"Rotation left wheel : {np.rad2deg(self.delta_phi_left)} deg,   "
+                    f"Rotation right wheel : {np.rad2deg(self.delta_phi_right)} deg"
+                )
+                self.log(f"Prev Ticks left : {self.left_tick_prev}   Prev Ticks right : {self.right_tick_prev}")
+                # self.log(
+                #     f"Prev integral error : {self.prev_int}")
 
-        self.duckiebot_is_moving = abs(self.delta_phi_left) > 0 or abs(self.delta_phi_right) > 0
+                # Calculate new odometry only when new data from encoders arrives
+                self.delta_phi_left = 0
+                self.delta_phi_right = 0
 
-        # Calculate new odometry only when new data from encoders arrives
-        self.delta_phi_left = self.delta_phi_right = 0
+                # Current estimate becomes previous estimate at next iteration
+                self.x_prev = self.x_curr
+                self.y_prev = self.y_curr
+                self.theta_prev = self.theta_curr
 
-        # Current estimate becomes previous estimate at next iteration
-        self.x_prev = self.x_curr
-        self.y_prev = self.y_curr
-        self.theta_prev = self.theta_curr
+                # Creating message to plot pose in RVIZ
+                odom = Odometry()
+                odom.header.frame_id = "map"
+                odom.header.stamp = rospy.Time.now()
 
-        # Creating message to plot pose in RVIZ
-        odom = Odometry()
-        odom.header.frame_id = "map"
-        odom.header.stamp = rospy.Time.now()
+                odom.pose.pose.position.x = self.x_curr  # x position - estimate
+                odom.pose.pose.position.y = self.y_curr  # y position - estimate
+                odom.pose.pose.position.z = 0  # z position - no flying allowed in Duckietown
 
-        odom.pose.pose.position.x = self.x_curr  # x position - estimate
-        odom.pose.pose.position.y = self.y_curr  # y position - estimate
-        odom.pose.pose.position.z = 0  # z position - no flying allowed in Duckietown
+                # these are quaternions - stuff for a different course!
+                odom.pose.pose.orientation.x = 0
+                odom.pose.pose.orientation.y = 0
+                odom.pose.pose.orientation.z = np.sin(self.theta_curr / 2)
+                odom.pose.pose.orientation.w = np.cos(self.theta_curr / 2)
 
-        # these are quaternions - stuff for a different course!
-        odom.pose.pose.orientation.x = 0
-        odom.pose.pose.orientation.y = 0
-        odom.pose.pose.orientation.z = np.sin(self.theta_curr / 2)
-        odom.pose.pose.orientation.w = np.cos(self.theta_curr / 2)
-
-        self.db_estimated_pose.publish(odom)
+                self.db_estimated_pose.publish(odom)
 
 
 
